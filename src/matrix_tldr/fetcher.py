@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import codecs
 import logging
+import zlib
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlsplit
 
@@ -32,6 +33,8 @@ MIN_TEXT_CHARS = 300
 ALLOWED_CONTENT_TYPES = frozenset({"text/html", "application/xhtml+xml"})
 PAYWALL_STATUS_CODES = frozenset({401, 402, 403})
 _REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
+_PLAIN_ENCODINGS = frozenset({"", "identity"})
+_SUPPORTED_ENCODINGS = _PLAIN_ENCODINGS | {"gzip", "x-gzip", "deflate"}
 # Gesamtfrist relativ zum Einzel-Timeout. httpx-Timeouts gelten pro Netzwerkschritt,
 # ein langsam tröpfelnder Server würde sie sonst beliebig strecken (Slowloris).
 _TOTAL_TIMEOUT_FACTOR = 3
@@ -93,6 +96,25 @@ def _decode(data: bytes, charset: str | None) -> str:
     return decode_file(data)
 
 
+def _inflate(decoder: zlib._Decompress, data: bytes, budget: int) -> bytes:
+    """Dekomprimiert ``data`` mit harter Obergrenze (Schutz vor Zip-Bomben).
+
+    Liefert höchstens ``budget + 1`` Bytes. Der Aufrufer erkennt am Überschreiten von
+    ``budget``, dass das Limit gesprengt wurde. httpx dekomprimiert dagegen jeden Chunk
+    vollständig und ungebremst, ein 64-KB-Chunk kann transient auf Dutzende MB wachsen.
+    """
+    parts: list[bytes] = []
+    size = 0
+    while data and size <= budget:
+        part = decoder.decompress(data, budget + 1 - size)
+        if not part:
+            break
+        parts.append(part)
+        size += len(part)
+        data = decoder.unconsumed_tail
+    return b"".join(parts)
+
+
 def _extract_sync(html: str) -> tuple[str | None, str | None]:
     """CPU-lastige Extraktion; läuft in einem Thread."""
     document = trafilatura.bare_extraction(
@@ -137,6 +159,8 @@ class Fetcher:
                 "User-Agent": USER_AGENT,
                 "Accept": "text/html,application/xhtml+xml",
                 "Accept-Language": "de,en",
+                # Nur Kodierungen, die wir selbst begrenzt dekomprimieren (kein br/zstd).
+                "Accept-Encoding": "gzip, deflate",
             },
         )
 
@@ -220,11 +244,30 @@ class Fetcher:
             if declared and declared.isdigit() and int(declared) > self._max_bytes:
                 raise ContentTooLargeError(f"Content-Length {declared} > Limit")
 
-            chunks: list[bytes] = []
-            total = 0
-            async for chunk in response.aiter_bytes():  # dekodierte Bytes zählen
-                total += len(chunk)
-                if total > self._max_bytes:
-                    raise ContentTooLargeError(f"mehr als {self._max_bytes} Bytes")
-                chunks.append(chunk)
-            return None, _decode(b"".join(chunks), response.charset_encoding)
+            return None, _decode(await self._read_body(response), response.charset_encoding)
+
+    async def _read_body(self, response: httpx.Response) -> bytes:
+        """Liest den Body mit Limit auf Draht- UND auf dekomprimierten Bytes."""
+        encoding = response.headers.get("content-encoding", "").strip().lower()
+        if encoding not in _SUPPORTED_ENCODINGS:
+            raise UnsupportedContentError(f"Content-Encoding {encoding}")
+        decoder = None if encoding in _PLAIN_ENCODINGS else zlib.decompressobj(zlib.MAX_WBITS | 32)
+
+        chunks: list[bytes] = []
+        wire = 0
+        total = 0
+        async for raw in response.aiter_raw():
+            wire += len(raw)
+            if wire > self._max_bytes:
+                raise ContentTooLargeError(f"mehr als {self._max_bytes} Bytes übertragen")
+            data = raw
+            if decoder is not None:
+                try:
+                    data = _inflate(decoder, raw, self._max_bytes - total)
+                except zlib.error as exc:
+                    raise UnsupportedContentError("Inhalt nicht dekomprimierbar") from exc
+            total += len(data)
+            if total > self._max_bytes:
+                raise ContentTooLargeError(f"mehr als {self._max_bytes} Bytes dekomprimiert")
+            chunks.append(data)
+        return b"".join(chunks)

@@ -180,6 +180,10 @@ class VerificationHandler:
         await self._client.accept_key_verification(event.transaction_id)
 
     async def _reject(self, event: KeyVerificationStart) -> None:
+        # nio hat für JEDEN start bereits eine lokale SAS angelegt. Ein Cancel an die
+        # Gegenstelle genügt nicht (ein böswilliger Client kann weitermachen), deshalb
+        # wird die lokale Sitzung verworfen: spätere key/mac-Events laufen ins Leere.
+        self._client.key_verifications.pop(event.transaction_id, None)
         await self._send(
             CANCEL_TYPE,
             event.sender,
@@ -191,9 +195,26 @@ class VerificationHandler:
             },
         )
 
+    def _trusted_sas(self, transaction_id: str, sender: str):
+        """Liefert die SAS nur, wenn sie zu einer vom Bot akzeptierten Eigenkonto-Sitzung gehört.
+
+        Voraussetzungen (alle müssen erfüllt sein): Absender ist das Bot-Konto, die Transaktion
+        wurde von ``_on_request``/``_on_start`` akzeptiert, und das Gegengerät gehört
+        tatsächlich zum Bot-Konto.
+        """
+        sas = self._client.key_verifications.get(transaction_id)
+        if sas is None or not self._is_own_user(sender) or transaction_id not in self._peers:
+            return None
+        if sas.other_olm_device.user_id != self._client.user_id:
+            return None
+        return sas
+
     async def _on_key(self, event: KeyVerificationKey) -> None:
-        sas = self._client.key_verifications.get(event.transaction_id)
+        sas = self._trusted_sas(event.transaction_id, event.sender)
         if sas is None:
+            logger.debug(
+                "key-Event %s ohne vertrauenswürdige Sitzung ignoriert", event.transaction_id
+            )
             return
         logger.info(
             "SAS-Emojis der Verifizierung (vergleiche sie mit Element):%s",
@@ -214,8 +235,11 @@ class VerificationHandler:
             )
 
     async def _on_mac(self, event: KeyVerificationMac) -> None:
-        sas = self._client.key_verifications.get(event.transaction_id)
+        sas = self._trusted_sas(event.transaction_id, event.sender)
         if sas is None:
+            logger.debug(
+                "mac-Event %s ohne vertrauenswürdige Sitzung ignoriert", event.transaction_id
+            )
             return
         if sas.canceled:
             logger.warning("Verifizierung %s wurde abgebrochen", event.transaction_id)

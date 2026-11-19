@@ -527,21 +527,133 @@ async def test_handler_never_raises():
     await handler.on_to_device(request_event())  # darf nicht werfen
 
 
-async def test_auto_confirm_confirms_only_when_enabled():
+def own_sas(device_user=BOT):
+    return SimpleNamespace(
+        get_emoji=lambda: [("🐶", "Dog"), ("🐱", "Cat")],
+        other_olm_device=SimpleNamespace(user_id=device_user, id="ELEMENT"),
+        canceled=False,
+        verified=True,
+    )
+
+
+def key_event(sender=BOT, tx="tx1"):
     from nio import KeyVerificationKey
 
-    sas = SimpleNamespace(get_emoji=lambda: [("🐶", "Dog"), ("🐱", "Cat")])
-    event = SimpleNamespace(transaction_id="tx1")
-    for auto in (False, True):
-        handler, client = make_verifier(auto_confirm=auto)
-        client.key_verifications = {"tx1": sas}
-        client.confirm_short_auth_string = AsyncMock()
-        event = KeyVerificationKey.from_dict(
-            {
-                "type": "m.key.verification.key",
-                "sender": BOT,
-                "content": {"transaction_id": "tx1", "key": "a" * 43},
-            }
-        )
-        await handler.on_to_device(event)
-        assert client.confirm_short_auth_string.await_count == (1 if auto else 0)
+    return KeyVerificationKey.from_dict(
+        {
+            "type": "m.key.verification.key",
+            "sender": sender,
+            "content": {"transaction_id": tx, "key": "a" * 43},
+        }
+    )
+
+
+def mac_event(sender=BOT, tx="tx1"):
+    from nio import KeyVerificationMac
+
+    return KeyVerificationMac.from_dict(
+        {
+            "type": "m.key.verification.mac",
+            "sender": sender,
+            "content": {"transaction_id": tx, "keys": "k", "mac": {"ed25519:X": "m"}},
+        }
+    )
+
+
+def start_event(sender, tx="tx9"):
+    from nio import KeyVerificationStart
+
+    return KeyVerificationStart.from_dict(
+        {
+            "type": "m.key.verification.start",
+            "sender": sender,
+            "content": {
+                "from_device": "DEV",
+                "transaction_id": tx,
+                "method": "m.sas.v1",
+                "key_agreement_protocols": ["curve25519-hkdf-sha256"],
+                "hashes": ["sha256"],
+                "message_authentication_codes": ["hkdf-hmac-sha256"],
+                "short_authentication_string": ["emoji", "decimal"],
+            },
+        }
+    )
+
+
+@pytest.mark.parametrize("auto", [False, True])
+async def test_auto_confirm_confirms_only_when_enabled_for_accepted_own_session(auto):
+    handler, client = make_verifier(auto_confirm=auto)
+    client.key_verifications = {"tx1": own_sas()}
+    client.confirm_short_auth_string = AsyncMock()
+    handler._peers["tx1"] = (BOT, "ELEMENT")  # von _on_request/_on_start akzeptiert
+    await handler.on_to_device(key_event())
+    assert client.confirm_short_auth_string.await_count == (1 if auto else 0)
+
+
+async def test_key_event_for_unaccepted_transaction_is_never_confirmed():
+    handler, client = make_verifier(auto_confirm=True)
+    client.key_verifications = {"tx1": own_sas()}
+    client.confirm_short_auth_string = AsyncMock()
+    await handler.on_to_device(key_event())  # tx1 nie akzeptiert
+    client.confirm_short_auth_string.assert_not_awaited()
+
+
+async def test_key_event_from_foreign_sender_is_never_confirmed():
+    handler, client = make_verifier(auto_confirm=True)
+    client.key_verifications = {"tx1": own_sas()}
+    client.confirm_short_auth_string = AsyncMock()
+    handler._peers["tx1"] = (BOT, "ELEMENT")
+    await handler.on_to_device(key_event(sender="@fremder:example.org"))
+    client.confirm_short_auth_string.assert_not_awaited()
+
+
+async def test_sas_with_foreign_device_is_never_confirmed_or_verified():
+    handler, client = make_verifier(auto_confirm=True)
+    client.key_verifications = {"tx1": own_sas(device_user="@fremder:example.org")}
+    client.confirm_short_auth_string = AsyncMock()
+    handler._peers["tx1"] = (BOT, "ELEMENT")
+    await handler.on_to_device(key_event())
+    await handler.on_to_device(mac_event())
+    client.confirm_short_auth_string.assert_not_awaited()
+    client.verify_device.assert_not_called()
+
+
+async def test_foreign_start_discards_local_sas_so_later_events_do_nothing():
+    """nio legt für jeden start eine SAS an. Ein Cancel allein reicht nicht."""
+    handler, client = make_verifier(auto_confirm=True)
+    foreign = "@fremder:example.org"
+    client.key_verifications = {"tx9": own_sas(device_user=foreign)}
+    client.confirm_short_auth_string = AsyncMock()
+
+    await handler.on_to_device(start_event(foreign))
+    assert "tx9" not in client.key_verifications
+    assert client.to_device.await_args.args[0].type == "m.key.verification.cancel"
+
+    # Böswilliger Client macht trotz Cancel weiter:
+    await handler.on_to_device(key_event(sender=foreign, tx="tx9"))
+    await handler.on_to_device(mac_event(sender=foreign, tx="tx9"))
+    client.confirm_short_auth_string.assert_not_awaited()
+    client.verify_device.assert_not_called()
+
+
+async def test_full_own_session_flow_verifies_device_and_sends_done():
+    handler, client = make_verifier(auto_confirm=True)
+    client.key_verifications = {"tx1": own_sas()}
+    client.confirm_short_auth_string = AsyncMock()
+    await handler.on_to_device(request_event())  # request -> ready, tx1 wird akzeptiert
+    await handler.on_to_device(key_event())
+    await handler.on_to_device(mac_event())
+    client.confirm_short_auth_string.assert_awaited_once_with("tx1")
+    client.verify_device.assert_called_once()
+    assert client.to_device.await_args.args[0].type == "m.key.verification.done"
+
+
+async def test_room_alias_cannot_be_used_to_pass_the_room_filter():
+    """canonical_alias ist von Raum-Admins frei setzbar und darf nicht autorisieren."""
+    fetch = AsyncMock(return_value=PAGE)
+    bot, _ = make_bot(fetch=fetch, env_extra={"ALLOWED_ROOMS": "#raum:example.org"})
+    room = MatrixRoom("!boeser-raum:example.org", BOT)
+    room.canonical_alias = "#raum:example.org"
+    await bot.on_message(room, make_event("https://example.org/a"))
+    await asyncio.gather(*bot._tasks)
+    fetch.assert_not_awaited()

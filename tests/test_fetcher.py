@@ -1,3 +1,5 @@
+import gzip
+
 import httpx
 import pytest
 
@@ -40,7 +42,21 @@ async def fake_resolver(host: str, port: int) -> list[str]:
 
 
 def make_fetcher(handler, *, max_bytes: int = 5_000_000) -> Fetcher:
-    transport = PinnedTransport(resolver=fake_resolver, inner=httpx.MockTransport(handler))
+    def streaming_handler(request: httpx.Request) -> httpx.Response:
+        """Echte Transporte liefern ungelesene Streams. httpx.Response(text=...) liest und
+        dekodiert den Body dagegen schon im Konstruktor, daher wird er hier neu verpackt."""
+        response = handler(request)
+        if not response.is_stream_consumed:
+            return response
+        return httpx.Response(
+            response.status_code,
+            headers=response.headers,
+            stream=httpx.ByteStream(response.content),
+        )
+
+    transport = PinnedTransport(
+        resolver=fake_resolver, inner=httpx.MockTransport(streaming_handler)
+    )
     return Fetcher(timeout_seconds=5, max_bytes=max_bytes, transport=transport)
 
 
@@ -273,4 +289,83 @@ async def test_latin1_charset_is_decoded():
     )
     result = await fetcher.fetch("https://example.org/")
     assert "über das Thema" in result.text
+    await fetcher.aclose()
+
+
+# ----------------------------------------------------------------- Kompression
+
+
+def gzip_response(payload: bytes, encoding: str = "gzip") -> httpx.Response:
+    return httpx.Response(
+        200,
+        headers={**HTML_HEADERS, "content-encoding": encoding},
+        stream=httpx.ByteStream(payload),  # ungelesen, damit die Rohbytes ankommen
+    )
+
+
+async def test_request_advertises_only_supported_encodings():
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(request.headers)
+        return httpx.Response(200, headers=HTML_HEADERS, text=ARTICLE_HTML)
+
+    fetcher = make_fetcher(handler)
+    await fetcher.fetch("https://example.org/")
+    assert captured["accept-encoding"] == "gzip, deflate"
+    await fetcher.aclose()
+
+
+async def test_gzip_and_deflate_bodies_are_decoded():
+    import zlib
+
+    fetcher = make_fetcher(lambda r: gzip_response(gzip.compress(ARTICLE_HTML.encode())))
+    assert "über das Thema" in (await fetcher.fetch("https://example.org/")).text
+    await fetcher.aclose()
+    fetcher = make_fetcher(lambda r: gzip_response(zlib.compress(ARTICLE_HTML.encode()), "deflate"))
+    assert "über das Thema" in (await fetcher.fetch("https://example.org/")).text
+    await fetcher.aclose()
+
+
+async def test_zip_bomb_is_rejected_with_bounded_memory(monkeypatch):
+    """~20 MB Nullen komprimieren auf wenige KB. Dekomprimiert wird nie über das Limit hinaus."""
+    import matrix_tldr.fetcher as fetcher_module
+
+    produced: list[int] = []
+    original = fetcher_module._inflate
+
+    def spy(decoder, data, budget):
+        out = original(decoder, data, budget)
+        produced.append(len(out))
+        return out
+
+    monkeypatch.setattr(fetcher_module, "_inflate", spy)
+    bomb = gzip.compress(b"<p>" + b"a" * 20_000_000)
+    assert len(bomb) < 100_000
+    fetcher = make_fetcher(lambda r: gzip_response(bomb), max_bytes=1_000_000)
+    with pytest.raises(ContentTooLargeError):
+        await fetcher.fetch("https://example.org/")
+    assert produced and max(produced) <= 1_000_001
+    await fetcher.aclose()
+
+
+async def test_compressed_size_over_limit_is_rejected():
+    fetcher = make_fetcher(lambda r: gzip_response(b"x" * 5000), max_bytes=2048)
+    with pytest.raises(ContentTooLargeError):
+        await fetcher.fetch("https://example.org/")
+    await fetcher.aclose()
+
+
+@pytest.mark.parametrize("encoding", ["br", "zstd", "compress"])
+async def test_unsupported_content_encoding_is_rejected(encoding):
+    fetcher = make_fetcher(lambda r: gzip_response(b"irgendwas", encoding))
+    with pytest.raises(UnsupportedContentError):
+        await fetcher.fetch("https://example.org/")
+    await fetcher.aclose()
+
+
+async def test_corrupt_gzip_is_rejected():
+    fetcher = make_fetcher(lambda r: gzip_response(b"\x1f\x8b\x08kaputt-kaputt-kaputt"))
+    with pytest.raises(UnsupportedContentError):
+        await fetcher.fetch("https://example.org/")
     await fetcher.aclose()

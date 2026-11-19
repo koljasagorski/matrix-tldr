@@ -552,7 +552,9 @@ class TldrBot:
             content=content,
             server_timestamp_ms=event.server_timestamp,
             start_time_ms=self._start_time_ms,
-            room_ids=(room.room_id, room.canonical_alias),
+            # Nur die Raum-ID: canonical_alias ist von Raum-Admins frei setzbarer State
+            # und darf nie zur Autorisierung dienen.
+            room_ids=(room.room_id,),
             allowed_rooms=self._settings.allowed_rooms,
         )
         if reason:
