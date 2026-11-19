@@ -31,7 +31,7 @@ def resolver_for(mapping: dict[str, list[str]]):
         "https://foo.localhost/",
         "https://127.0.0.1/",
         "https://127.1/",
-        "https://10.0.0.144/",
+        "https://10.0.0.1/",
         "https://10.1.2.3/",
         "https://172.16.5.5/",
         "https://192.168.1.1/",

@@ -1,130 +1,195 @@
 # matrix-tldr
 
-Matrix-Bot, der Links in Räumen auf Deutsch in genau zwei Sätzen zusammenfasst. Postet jemand
-einen `https://`-Link, ruft der Bot die Seite sicher ab, extrahiert den Haupttext (trafilatura),
-lässt eine KI zusammenfassen und antwortet als echte Matrix-Antwort (Reply) auf die Nachricht.
-Verschlüsselte Räume (E2EE) werden unterstützt.
+A Matrix bot that summarizes links in exactly two sentences. When someone posts an `https://`
+link in a room, the bot fetches the page safely, extracts the main text with
+[trafilatura](https://trafilatura.readthedocs.io/), asks an AI model for a summary, and replies
+to the original message as a proper Matrix reply (`m.notice`). Encrypted rooms (E2EE) are
+supported.
 
-## Voraussetzungen
+> **Language note:** the bot's summaries and its user-facing messages are written in **German**
+> (the system prompt asks for German output). Log messages are German as well. Everything else,
+> including this documentation, is in English.
 
-1. **Bot-Account** auf dem Homeserver anlegen (z. B. `@tldr:example.org`). Der Account wird
-   nur vom Bot genutzt.
-2. **API-Key** besorgen. Standard ist Claude (`ANTHROPIC_API_KEY`), alternativ OpenAI oder ein
-   OpenAI-kompatibler Endpunkt.
-3. Python 3.11+ (lokal) oder Docker.
+Reply format: `🔗 example.org: <two-sentence summary>`
 
-## Lokaler Start
+## Features
+
+- Watches all joined rooms (optionally restricted to specific room IDs)
+- End-to-end encryption with a persistent device and session (no new device per restart)
+- SAS emoji device verification, accepted only from the bot's own account
+- Strict SSRF protection (see [Security](#security-and-residual-risks))
+- Per-room rate limit, typing indicator, at most 3 concurrent fetches
+- Ignores its own messages, notices, edits, and events from before startup; de-duplicates events
+- Auto-joins on invite (optionally only from allowed inviters)
+- Providers: Anthropic (default), OpenAI, or any OpenAI-compatible endpoint
+- Hardened Docker image (non-root, read-only filesystem, no capabilities)
+
+## Requirements
+
+1. A **bot account** on your homeserver (for example `@tldr:example.org`). Use it only for this bot.
+2. An **API key** for your AI provider (`ANTHROPIC_API_KEY` by default).
+3. Python 3.11+ for a local run, or Docker with the Compose plugin.
+
+## Configuration
+
+Copy `.env.example` to `.env` and fill it in. **Never commit `.env`**; it is git-ignored.
+
+Required values:
+
+| Variable | Meaning |
+| --- | --- |
+| `MATRIX_HOMESERVER` | Client API URL, e.g. `https://matrix.example.org` |
+| `MATRIX_USER_ID` | Full bot ID, e.g. `@tldr:example.org` |
+| `MATRIX_PASSWORD` | Only needed for the very first login (see below) |
+| `AI_PROVIDER` | `anthropic` (default) or `openai` |
+| `AI_MODEL` | Model name for the chosen provider (never hardcoded) |
+| `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` | Key matching `AI_PROVIDER` |
+
+Everything else is optional and documented in `.env.example` (timeouts, size limits, rate limit,
+`ALLOWED_ROOMS`, `AUTO_JOIN_ALLOWED_INVITERS`, `VERIFY_AUTO_CONFIRM`, `LOG_LEVEL`, ...).
+
+On the first start the bot logs in with `MATRIX_PASSWORD` and saves the session to
+`store/session.json` (mode 0600). Every later start reuses that session, so no new device is
+created. After the first successful start you can remove the password from `.env`.
+
+`ALLOWED_ROOMS` takes **room IDs** (`!abc:server`, shown in Element under Room settings,
+Advanced). Room aliases are intentionally not accepted: room admins can set aliases freely, so
+they must never be used for authorization.
+
+## Run locally
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements-dev.txt        # oder requirements.txt ohne Test-Werkzeuge
-cp .env.example .env                       # Werte eintragen, siehe unten
+pip install -r requirements.txt
+cp .env.example .env        # then edit it
 python -m matrix_tldr
 ```
 
-Beim ersten Start meldet sich der Bot mit `MATRIX_PASSWORD` an und speichert die Session
-(`store/session.json`, Rechte 0600). Jeder weitere Start nutzt diese Session, es entsteht
-**kein** neues Gerät. Danach kann das Passwort aus der `.env` entfernt werden.
-
-Pflichtwerte in der `.env`: `MATRIX_HOMESERVER`, `MATRIX_USER_ID`, `MATRIX_PASSWORD` (nur
-erster Start), `AI_PROVIDER`, `AI_MODEL` und der passende API-Key.
-
-## Docker-Start
+## Run with Docker
 
 ```bash
-cp .env.example .env                       # Werte eintragen
+cp .env.example .env        # then edit it
 docker compose up -d --build
 docker compose logs -f matrix-tldr
 ```
 
-Der Container läuft als Non-Root-User, mit read-only Dateisystem, ohne Capabilities und mit
-Log-Rotation. Crypto-Store und Session liegen im benannten Volume `matrix-tldr-store`.
+The container runs as a non-root user (uid 10001) with a read-only root filesystem, all
+capabilities dropped, `no-new-privileges`, a memory/PID limit, and log rotation. The crypto store
+and session live in the named volume `matrix-tldr-store`.
 
-## E2EE: Store-Volume und Geräteverifizierung
+Update with `git pull --ff-only && docker compose up -d --build`.
 
-**Das Store-Volume (`matrix-tldr-store` bzw. `./store`) darf nie gelöscht werden.** Es enthält die
-Geräteschlüssel des Bots. Geht es verloren, kann der Bot bisherige verschlüsselte Nachrichten nicht
-mehr lesen, meldet sich als neues Gerät an und muss neu verifiziert werden. Backups des Volumes
-enthalten Schlüsselmaterial und sind entsprechend zu schützen.
+**Never run `docker compose down -v` and never delete the store volume.** It holds the bot's
+device keys. Without it the bot cannot read earlier encrypted history, logs in as a new device,
+and has to be verified again. Backups of the volume contain key material and must be protected.
 
-Beim Start loggt der Bot Geräte-ID und Ed25519-Fingerprint. Der Bot funktioniert auch **ohne**
-Verifizierung (er sendet an unverifizierte Geräte). Verifizieren lohnt sich, damit Element die
-Session nicht als unverifiziert warnt. Hinweis: matrix-nio unterstützt kein Cross-Signing. Der
-Bot kann seine Nachrichten daher nicht selbst als "verifiziert" signieren, Mitglieder können in
-Element trotzdem einen Hinweis zum Absendergerät sehen.
+## End-to-end encryption and device verification
 
-Verifiziert wird **eine Session des Bot-Kontos** (nicht von Fremdkonten):
+The bot works in encrypted rooms **without** being verified: it sends to unverified devices.
+Verifying the bot's device is optional but removes Element's "unverified session" warning for the
+bot account's own session.
 
-### Variante A: Emoji-Vergleich (SAS)
+On startup the bot logs its device ID and Ed25519 fingerprint (look for the line containing
+`Ed25519-Fingerprint`).
 
-1. In `.env` `VERIFY_AUTO_CONFIRM=true` setzen und den Bot (neu) starten.
-2. Mit dem **Bot-Konto** in Element anmelden (z. B. im Browser).
-3. Einstellungen, Sitzungen: die Sitzung `matrix-tldr` öffnen und "Sitzung verifizieren" wählen
-   (Beschriftung je nach Element-Version leicht abweichend), Emoji-Verifizierung starten.
-4. Die Emojis in Element mit dem Bot-Log vergleichen. Stimmen sie überein, in Element bestätigen.
-   Das Log meldet dann "Gerät ... ist jetzt verifiziert".
-5. `VERIFY_AUTO_CONFIRM=false` setzen und den Bot neu starten.
+Limitation: matrix-nio does not implement cross-signing, so the bot cannot cross-sign its device.
+Element may still show a shield next to the bot's messages even after the device is verified.
 
-Der Bot nimmt Verifizierungsanfragen ausschließlich vom eigenen Bot-Konto an, auch bei
-`VERIFY_AUTO_CONFIRM=true`. Die eigentliche Prüfung ist der Emoji-Vergleich durch dich in Element.
-nio kennt `request`/`ready`/`done` nicht; `verification.py` ergänzt sie. Das ist gegen die
-Protokollbeschreibung implementiert, aber nicht gegen jede Element-Version getestet.
+### Option A: emoji comparison (SAS)
 
-### Variante B (Fallback): manuell per Fingerprint
+1. Set `VERIFY_AUTO_CONFIRM=true` and restart the bot.
+2. Log in to Element **as the bot account** (for example in a private browser window).
+3. Open Settings, Sessions, select the session named `matrix-tldr`, and start emoji verification.
+4. Compare the emojis Element shows with the emojis in the bot log. If they match, confirm in
+   Element. The bot log then reports that the device is verified.
+5. Set `VERIFY_AUTO_CONFIRM=false` and restart.
 
-Funktioniert Variante A nicht, geht es ohne den Bot-Code: In Element beim Bot-Konto in den
-Sitzungen `matrix-tldr` wählen, "Manuell verifizieren" öffnen und den dort angezeigten
-Sitzungsschlüssel mit dem **Ed25519-Fingerprint aus dem Bot-Log** vergleichen
-(`docker compose logs matrix-tldr | grep Fingerprint`). Stimmen beide überein, bestätigen.
+`VERIFY_AUTO_CONFIRM` only makes the *bot* confirm its side. The security comes from you
+comparing the emojis in Element. The bot only accepts verification requests from its own account
+and rejects everyone else. matrix-nio lacks the `request`/`ready`/`done` messages of the
+verification flow, so `verification.py` implements them; this follows the spec but has not been
+tested against every Element version.
 
-### Funktioniert der Bot in verschlüsselten Räumen?
+### Option B (fallback): compare the fingerprint manually
 
-Bot in einen verschlüsselten Raum einladen (er tritt automatisch bei, siehe
-`AUTO_JOIN_ALLOWED_INVITERS`) und einen `https://`-Link posten. Antwortet der Bot mit
-"🔗 domain: ...", funktioniert Senden und Lesen. Erscheint im Log "Nicht entschlüsselbar", fehlt
-der Raumschlüssel: Der Bot fordert ihn automatisch an, und Element-Clients teilen ihn in der Regel
-beim nächsten Nachrichtenversand.
+In Element, open the bot account's session `matrix-tldr`, choose manual verification, and compare
+the session key shown there with the Ed25519 fingerprint from the bot log
+(`docker compose logs matrix-tldr | grep Fingerprint`). Confirm if they match.
 
-## Sicherheit und Restrisiken
+### Check that it works in an encrypted room
 
-- **SSRF-Schutz** (`security.py`): nur `https` auf Port 443, keine Zugangsdaten in URLs. Hostnamen
-  werden aufgelöst und **alle** Adressen geprüft (IPv4 und IPv6). Blockiert werden Loopback,
-  private Netze, Link-Local inkl. Cloud-Metadata, CGNAT, Multicast, reservierte und
-  unspezifizierte Adressen, IPv4-mapped IPv6 sowie Sonderschreibweisen (dezimal, oktal, hex).
-  Redirects werden manuell verfolgt (max. 5), jedes Ziel wird erneut vollständig geprüft.
-- **DNS-Rebinding**: Auflösung, Prüfung und Verbindung sind ein Schritt; der Bot verbindet sich mit
-  der geprüften IP, SNI und `Host` bleiben der Hostname, das Zertifikat wird gegen den Namen geprüft.
-- **Rate-Limit** pro Raum (`RATE_LIMIT_PER_ROOM_PER_MINUTE`) begrenzt die KI-Kosten.
-- **Prompt-Injection**: Der Webseitentext steht in `<document>`-Tags und ist als nicht
-  vertrauenswürdig markiert; die Ausgabe wird auf zwei Sätze und 600 Zeichen begrenzt. Das mindert
-  das Risiko, schließt aber nicht aus, dass eine präparierte Seite die Zusammenfassung verfälscht.
-  Zusammenfassungen sind keine verlässliche Prüfung des Seiteninhalts.
-- **Restrisiken**: Der Bot kann keine Seiten hinter Login oder Paywall lesen. Der Schutz gilt nicht
-  für Ziele, auf die der Host über eine Netzwerkregel umgeleitet wird. Sinnvoll ist zusätzlich,
-  den Container per Firewall an interne Netze nicht heranzulassen. Der Bot sendet Seitentext an den
-  gewählten KI-Anbieter; das ist eine Datenschutzentscheidung für deine Räume.
-- Logs enthalten Raum-ID, Event-ID und Domain, aber keine Nachrichteninhalte oder URL-Pfade.
+Invite the bot to an encrypted room (it joins automatically; see `AUTO_JOIN_ALLOWED_INVITERS`) and
+post an `https://` link. If the bot replies with `🔗 <domain>: ...`, sending and decrypting both
+work. If the log shows an undecryptable message (German: `Nicht entschlüsselbar`), the room key
+has not arrived yet; the bot requests it automatically and other clients normally share it when
+they next send a message.
 
-## Provider und Modell wechseln
+## Security and residual risks
 
-Alles steht in der `.env`, nichts im Code.
+- **SSRF protection** (`security.py`, `fetcher.py`): only `https` on port 443, no credentials in
+  URLs, internal hostnames and single-label hosts blocked. Host names are resolved and **every**
+  returned address is checked (IPv4 and IPv6): loopback, private ranges, link-local including
+  cloud metadata, CGNAT, multicast, reserved and unspecified addresses, IPv4-mapped IPv6, NAT64,
+  6to4, Teredo, and unusual IP notations (decimal, octal, hex).
+- **DNS rebinding:** resolution, validation, and connection happen in one step. The bot connects
+  to the validated IP while keeping the original host name for SNI, the `Host` header, and
+  certificate verification.
+- **Redirects** are followed manually (max. 5) and every hop is fully re-validated.
+- **Resource limits:** the bot only advertises `gzip`/`deflate`, rejects other content encodings,
+  and decompresses with a hard output cap, so a small compressed body cannot expand into a large
+  one (zip bomb). Both the transferred and the decompressed size are limited.
+- **Rate limit** per room (`RATE_LIMIT_PER_ROOM_PER_MINUTE`) bounds AI costs.
+- **Prompt injection:** page text is wrapped in `<document>` tags and declared untrusted in the
+  system prompt, tag-like content is neutralized, and the output is cut to two sentences and 600
+  characters. This reduces the risk but cannot rule out a crafted page skewing a summary. Do not
+  treat summaries as a security check of the linked page.
+- **Residual risks:** the SSRF checks are enforced in the bot only. If you run it next to
+  sensitive internal services, also block internal networks for the container at the network
+  level. Page text is sent to your chosen AI provider; that is a privacy decision for your rooms.
+  The bot cannot read pages behind logins or paywalls and does not execute JavaScript.
+- Logs contain room IDs, event IDs, and the domain, but not message bodies or URL paths.
 
-| Ziel | Einstellung |
+## Choosing a provider and model
+
+Everything is configured in `.env`; nothing is hardcoded.
+
+| Goal | Settings |
 | --- | --- |
-| Claude (Standard) | `AI_PROVIDER=anthropic`, `AI_MODEL=claude-haiku-5-5`, `ANTHROPIC_API_KEY` |
-| Claude, stärker | `AI_MODEL=claude-sonnet-5-5` (ca. 20-mal teurer, selten nötig) |
-| OpenAI | `AI_PROVIDER=openai`, `AI_MODEL=<Modell>`, `OPENAI_API_KEY` |
-| OpenAI-kompatibel (selbst gehostet, EU-Anbieter) | zusätzlich `OPENAI_BASE_URL=https://.../v1` |
+| Claude (default) | `AI_PROVIDER=anthropic`, `AI_MODEL=claude-haiku-5-5`, `ANTHROPIC_API_KEY` |
+| Claude, stronger | `AI_MODEL=claude-sonnet-5-5` (noticeably more expensive, rarely needed) |
+| OpenAI | `AI_PROVIDER=openai`, `AI_MODEL=<model>`, `OPENAI_API_KEY` |
+| OpenAI-compatible (self-hosted or other vendor) | additionally `OPENAI_BASE_URL=https://.../v1` |
 
-**Modellwahl:** Für eine Zwei-Satz-Zusammenfassung ist `claude-haiku-5-5` (0,10 $ / 0,50 $ pro
-Million Token) das beste Preis-Leistungs-Verhältnis. Eine Zusammenfassung mit rund 4.000
-Eingabe-Token kostet damit ungefähr 0,05 Cent. `AI_EFFORT=low` hält den Denkaufwand klein. Bei
-Modellen ohne Effort-Unterstützung `AI_EFFORT=none` setzen.
+For a two-sentence summary a small, cheap model is plenty, so `claude-haiku-5-5` is the
+recommended default: it gives the best price/quality ratio, and a summary costs a fraction of a
+cent. Check your provider's current pricing before relying on a number. `AI_EFFORT=low` keeps
+reasoning effort small; set `AI_EFFORT=none` for models that do not support the effort parameter.
 
-## Entwicklung
+## Development
 
 ```bash
 pip install -r requirements-dev.txt && pip install -e .
-pytest            # Unit-Tests, keine echten API-Aufrufe
-ruff check . && python -m compileall -q src tests
+pytest                                   # unit tests, no real API calls
+ruff check . && ruff format --check . && python -m compileall -q src tests
 ```
+
+Project layout:
+
+```
+src/matrix_tldr/
+  __main__.py        entry point, logging, signals, exit codes
+  config.py          loads and validates .env, collects all errors at once
+  bot.py             Matrix logic: login, E2EE, filters, rate limit, replies, sync loop
+  verification.py    SAS emoji device verification
+  url_utils.py       link extraction from messages
+  security.py        SSRF protection with DNS pinning
+  fetcher.py         safe download, redirects, size limits, text extraction
+  ai/                prompt and post-processing, Anthropic and OpenAI providers
+tests/               pytest suite (no network access needed)
+docs/HANDOVER.md     operations notes for maintainers
+```
+
+## Deployment notes
+
+A maintainers' handover document lives in [`docs/HANDOVER.md`](docs/HANDOVER.md). The repository
+is public: never put IP addresses, host names, credentials, or keys into it or into any commit.

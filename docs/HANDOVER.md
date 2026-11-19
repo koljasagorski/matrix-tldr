@@ -1,50 +1,39 @@
-# Übergabestand matrix-tldr
+# matrix-tldr handover
 
-Stand: 2026-11-19. Dieses Dokument ist für andere Coding-Agenten und Betreiber gedacht.
-Das Repo ist öffentlich: **keine IPs, Hostnamen, Zugangsdaten oder Schlüssel hier eintragen.**
-Konkrete Zugangsdaten und Adressen stehen nur beim Betreiber (privat).
+Last updated: 2026-11-19. This document is for maintainers and other coding agents.
+The repository is public: **do not add IP addresses, host names, credentials, or keys here.**
+Concrete addresses and access details are kept privately by the operator.
 
-## Code-Stand
+## Code status
 
-- Bot, SSRF-Schutz, Claude-/OpenAI-Anbindung, Verifizierungs-Shim und 214 Tests sind fertig
-  (`pytest`, `ruff check`, `ruff format --check`, `compileall` laufen sauber).
-- Drei Findings des automatischen Security-Reviews sind behoben und mit Regressionstests
-  abgesichert: Raumfilter nur per Raum-ID (kein Alias), Dekompression mit harter Obergrenze
-  (nur gzip/deflate, Rohbytes werden gezählt), SAS-Verifizierung nur für akzeptierte
-  Eigenkonto-Transaktionen (lokale nio-SAS fremder Nutzer wird verworfen).
+- Bot, SSRF protection, Anthropic/OpenAI providers, verification shim, and 214 tests are done.
+  `pytest`, `ruff check`, `ruff format --check`, and `compileall` all pass.
+- Three findings from an automated security review were fixed and covered by regression tests:
+  room filter compares room IDs only (never aliases), decompression has a hard output cap (only
+  gzip/deflate, raw bytes are counted), and SAS verification is limited to transactions the bot
+  accepted from its own account (foreign users' local nio SAS sessions are discarded).
 
-## Server-Setup (Homelab)
+## Deployment
 
-| Punkt | Stand |
+| Item | State |
 | --- | --- |
-| Host | Proxmox VE (x86_64). Docker läuft **nicht** auf dem Hypervisor. |
-| Container | Eigener unprivilegierter LXC, Debian 13, `nesting=1,keyctl=1`, 1 Kern, 1 GB RAM, 8 GB Disk, DHCP, Autostart |
-| Docker | Docker CE + Compose-Plugin aus dem offiziellen Docker-Repo, per systemd aktiv |
-| Projektpfad im LXC | `/opt/matrix-tldr` (Klon dieses Repos, Branch `main`) |
-| Image | `matrix-tldr:latest`, lokal im LXC gebaut (`docker compose build`) |
-| Volume | `matrix-tldr-store` (Crypto-Store und Session). **Nie löschen**, siehe README |
-| Konfiguration | `/opt/matrix-tldr/.env`, Rechte 0600, nur lokal, **nicht im Git** |
-| Netz | Keine Firewall-Sperre zum LAN (bewusste Entscheidung des Betreibers). Es gilt nur der SSRF-Schutz im Bot |
-| Homeserver | `https://m.sgr.ski` (öffentlicher Homeserver-Name, steht in der `.env`) |
-| KI | Anthropic, `AI_MODEL=claude-haiku-5-5`, `AI_EFFORT=low` |
+| Host | Proxmox VE. Docker is **not** installed on the hypervisor. |
+| Container | Dedicated unprivileged Debian 13 LXC with `nesting=1,keyctl=1`, 1 core, 1 GB RAM, 8 GB disk, DHCP, autostart |
+| Docker | Docker CE and the Compose plugin from the official Docker repository |
+| Project path in the LXC | `/opt/matrix-tldr` (clone of this repo, branch `main`) |
+| Image | `matrix-tldr:latest`, built locally in the LXC with `docker compose build` |
+| Volume | `matrix-tldr-store` (crypto store and session). **Never delete it.** |
+| Configuration | `/opt/matrix-tldr/.env`, mode 0600, local only, **not in git** |
+| Network | No LAN firewall around the container (the operator chose this). Only the bot's SSRF protection applies. |
+| AI | Anthropic, `AI_MODEL=claude-haiku-5-5`, `AI_EFFORT=low` |
+| Bot account | Created on the operator's own homeserver; credentials only in the LXC `.env` |
+| Rooms | `ALLOWED_ROOMS` restricts the bot to the target room (room ID, no alias) |
 
-Geprüft im LXC: Docker-Smoke-Test mit `--read-only --cap-drop ALL --no-new-privileges`, Store-Volume
-als uid 10001 beschreibbar, Root-Dateisystem schreibgeschützt, Konfigurationsfehler bei
-unvollständiger `.env` liefert Exit-Code 2 mit klarer deutscher Meldung.
+Status: the bot is running and confirmed working by the operator.
 
-## Noch offen (Stand dieses Dokuments)
+## Operations
 
-1. Bot-Konto auf dem Homeserver muss existieren. `MATRIX_USER_ID` und `MATRIX_PASSWORD` sowie
-   `ANTHROPIC_API_KEY` trägt der Betreiber selbst in die `.env` im LXC ein (nicht über Chat/Git).
-2. Danach starten: `cd /opt/matrix-tldr && docker compose up -d` und `docker compose logs -f`.
-3. Beim ersten Start Geräte-ID und Ed25519-Fingerprint aus dem Log notieren, Gerät in Element
-   verifizieren (README, Abschnitt E2EE).
-4. Ziel-Raum steht noch nicht fest. Betreiber nennt ihn später. Dann Raum-ID in `ALLOWED_ROOMS`
-   eintragen (keine Aliase), Bot einladen, Container neu starten.
-5. Der Verifizierungs-Shim ist nicht gegen echte Element-Versionen getestet. Fallback ist der
-   manuelle Fingerprint-Vergleich (README).
-
-## Update-Ablauf im LXC
+Update:
 
 ```bash
 cd /opt/matrix-tldr
@@ -53,13 +42,30 @@ docker compose up -d --build
 docker compose logs -f --tail=50 matrix-tldr
 ```
 
-Das Store-Volume bleibt dabei erhalten. Nie `docker compose down -v` verwenden.
+The store volume survives updates. Never use `docker compose down -v`.
 
-## Bekannte Einschränkungen
+Rotate credentials by editing `/opt/matrix-tldr/.env` on the server and running
+`docker compose up -d`. API keys and passwords must not go through chat tools or git.
 
-- Kein Cross-Signing (matrix-nio unterstützt es nicht): Element kann den Bot als nicht
-  cross-signiert markieren, auch wenn das Gerät verifiziert ist.
-- Keine Seiten hinter Login/Paywall, kein JavaScript-Rendering.
-- Prompt-Injection wird gemindert (Delimiter, Längen- und Satzbegrenzung), aber nicht ausgeschlossen.
-- Linear-Projektzuordnung ist in dieser Sitzung nicht erfolgt, weil der Linear-Zugang nicht
-  authentifiziert war.
+## Learnings
+
+- Some homeserver gateways mangle percent-encoded room aliases in the request path. If joining by
+  alias fails with "not a legal room ID or room alias", resolve the alias directly against the
+  target server's client API and join by room ID instead (`POST /rooms/{roomId}/join`).
+- The room alias lookup and the join must not be confused with authorization: the bot filters by
+  room ID only.
+
+## Open items
+
+1. The verification shim is not tested against every Element version. Fallback: compare the
+   Ed25519 fingerprint manually (see README).
+2. No cross-signing (matrix-nio limitation), so Element may show a shield next to the bot's
+   messages.
+3. Rotate any API key or secret that was ever pasted into a chat session.
+4. Consider network-level isolation of the container from internal networks as a second line of
+   defense behind the SSRF protection.
+
+## Known limitations
+
+- No pages behind logins or paywalls, no JavaScript rendering.
+- Prompt injection is mitigated (delimiters, length and sentence limits) but not eliminated.
