@@ -1,0 +1,6 @@
+matrix-nio[e2e]>=0.25,<1
+trafilatura>=2.0,<3
+httpx>=0.27,<1
+openai>=1.50,<3
+anthropic>=2.0,<3
+python-dotenv>=1.0,<2

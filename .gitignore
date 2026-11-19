@@ -1,0 +1,8 @@
+.env
+.venv/
+store/*
+!store/.gitkeep
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
