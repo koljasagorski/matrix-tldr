@@ -10,6 +10,8 @@ from urllib.parse import urlsplit
 _URL_RE = re.compile(r"https://[^\s<>\"'`\x00-\x1f\x7f]+", re.IGNORECASE)
 _TRAILING_PUNCT = ".,;:!?>\"'"
 _MAX_URL_LENGTH = 2048
+# Matrix-Permalinks (u. a. Mention-Pills ``https://matrix.to/#/@user:server``).
+_MATRIX_LINK_HOSTS = frozenset({"matrix.to"})
 _REPLY_HTML_RE = re.compile(r"<mx-reply>.*?</mx-reply>", re.IGNORECASE | re.DOTALL)
 
 
@@ -106,6 +108,9 @@ def extract_urls(
         except ValueError:
             continue
         if not parts.hostname:
+            continue
+        if parts.hostname.lower() in _MATRIX_LINK_HOSTS:
+            # Mentions, Raum- und Event-Permalinks sind keine Webseiten zum Zusammenfassen.
             continue
         if url in seen:
             continue

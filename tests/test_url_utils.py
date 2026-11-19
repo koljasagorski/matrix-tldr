@@ -87,3 +87,14 @@ def test_reply_fallback_is_stripped():
 def test_display_domain_strips_www():
     assert display_domain("https://www.example.org/pfad") == "example.org"
     assert display_domain("https://news.example.org/") == "news.example.org"
+
+
+def test_mention_pill_is_not_a_link():
+    body = "@tldr:m.sgr.ski was meinst du?"
+    formatted = '<a href="https://matrix.to/#/@tldr:m.sgr.ski">tldr</a> was meinst du?'
+    assert extract_urls(body, formatted, max_links=5) == []
+
+
+def test_matrix_to_permalinks_are_ignored_but_real_links_kept():
+    body = "https://matrix.to/#/!room:server/$event https://example.org/a"
+    assert extract_urls(body, max_links=5) == ["https://example.org/a"]
